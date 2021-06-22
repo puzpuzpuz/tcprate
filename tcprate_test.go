@@ -20,7 +20,8 @@ import (
 )
 
 const (
-	allowedRateThreshold = 1.05
+	lowerRateThreshold = 0.95
+	upperRateThreshold = 1.05
 )
 
 type testDef struct {
@@ -38,26 +39,26 @@ func TestListener(t *testing.T) {
 	testCases := []testDef{
 		{
 			name:            "bandwidth limit per server",
-			limit:           8 * 1024, // 8 KB/sec
-			bodySize:        8 * 1024, // 8 KB
-			numberOfClients: 3,
-			numberOfReqs:    3,
+			limit:           1024,     // 1 KB/sec
+			bodySize:        4 * 1024, // 4 KB
+			numberOfClients: 4,
+			numberOfReqs:    1,
 			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op
 		},
 		{
 			name:            "bandwidth limit per conn",
 			perConnLimit:    4 * 1024, // 4 KB/sec
-			bodySize:        8 * 1024, // 8 KB
-			numberOfClients: 5,
-			numberOfReqs:    5,
+			bodySize:        1024,     // 1 KB
+			numberOfClients: 10,
+			numberOfReqs:    64,
 			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op
 		},
 		{
 			name:            "bandwidth limit per server and conn",
-			limit:           10 * 1024, // 10 KB/sec
-			perConnLimit:    4 * 1024,  // 4 KB/sec
-			bodySize:        8 * 1024,  // 8 KB
-			numberOfClients: 3,
+			limit:           16 * 1024, // 16 KB/sec
+			perConnLimit:    8 * 1024,  //  8 KB/sec
+			bodySize:        32 * 1024, // 32 KB
+			numberOfClients: 2,
 			numberOfReqs:    3,
 			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op
 		},
@@ -84,9 +85,9 @@ func TestListener(t *testing.T) {
 			},
 		},
 		{
-			name:            "low bandwidth limit per server",
-			perConnLimit:    1024,     // 1 KB/sec
-			bodySize:        3 * 1024, // 3 KB
+			name:            "low bandwidth limit per conn",
+			perConnLimit:    1024,      //  1 KB/sec
+			bodySize:        16 * 1024, // 16 KB
 			numberOfClients: 1,
 			numberOfReqs:    1,
 			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op
@@ -120,6 +121,7 @@ func testLimits(t *testing.T, def testDef) (totalPerClient []uint64, took time.D
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+	cready := make(chan bool, def.numberOfClients)
 	cstarted := make(chan bool, def.numberOfClients)
 	cdone := make(chan bool, def.numberOfClients)
 
@@ -129,6 +131,7 @@ func testLimits(t *testing.T, def testDef) (totalPerClient []uint64, took time.D
 		c := &testClient{addr: addr}
 		clients = append(clients, c)
 		go func() {
+			cready <- true
 			wg.Wait()
 			for j := 0; j < def.numberOfReqs; j++ {
 				if err := c.sendRequest(); err != nil {
@@ -142,6 +145,9 @@ func testLimits(t *testing.T, def testDef) (totalPerClient []uint64, took time.D
 		}()
 	}
 
+	for i := 0; i < def.numberOfClients; i++ {
+		<-cready
+	}
 	start := time.Now()
 	wg.Done()
 
@@ -150,12 +156,15 @@ func testLimits(t *testing.T, def testDef) (totalPerClient []uint64, took time.D
 	}
 	def.changeLimitFn(lim)
 
-	totalPerClient = make([]uint64, def.numberOfClients)
 	for i := 0; i < def.numberOfClients; i++ {
 		<-cdone
-		totalPerClient[i] += atomic.LoadUint64(&clients[i].downloaded)
 	}
+
 	took = time.Since(start)
+	totalPerClient = make([]uint64, def.numberOfClients)
+	for i := 0; i < def.numberOfClients; i++ {
+		totalPerClient[i] += clients[i].downloaded
+	}
 
 	return
 }
@@ -166,33 +175,43 @@ func assertServerLimit(t *testing.T, def testDef, totalPerClient []uint64, took 
 		total += t
 	}
 	actualRate := float64(total) / took.Seconds()
-	expectedRate := float64(def.limit) * allowedRateThreshold
+	expectedLowerRate := float64(def.limit) * lowerRateThreshold
+	expectedUpperRate := float64(def.limit) * upperRateThreshold
 	if def.changeLimit {
-		if actualRate < expectedRate {
-			t.Errorf("rate limit wasn't changed for server: actual=%f, expected=%f",
-				actualRate, expectedRate)
+		if actualRate < expectedUpperRate {
+			t.Errorf("rate limit wasn't changed for server: actual=%f, expected at least=%f",
+				actualRate, expectedUpperRate)
 		}
 	} else {
-		if actualRate > expectedRate {
-			t.Errorf("rate exceeded for server: actual=%f, expected=%f",
-				actualRate, expectedRate)
+		if actualRate < expectedLowerRate {
+			t.Errorf("rate was too low for server: actual=%f, expected at least=%f",
+				actualRate, expectedLowerRate)
+		}
+		if actualRate > expectedUpperRate {
+			t.Errorf("rate was too high for server: actual=%f, expected at most=%f",
+				actualRate, expectedUpperRate)
 		}
 	}
 }
 
 func assertPerConnLimit(t *testing.T, def testDef, totalPerClient []uint64, took time.Duration) {
-	expectedRate := float64(def.perConnLimit) * allowedRateThreshold
+	expectedLowerRate := float64(def.perConnLimit) * lowerRateThreshold
+	expectedUpperRate := float64(def.perConnLimit) * upperRateThreshold
 	for i := 0; i < def.numberOfClients; i++ {
 		actualRate := float64(totalPerClient[i]) / took.Seconds()
 		if def.changeLimit {
-			if actualRate < expectedRate {
-				t.Errorf("rate limit wasn't changed for client %d: actual=%f, expected=%f",
-					i, actualRate, expectedRate)
+			if actualRate < expectedUpperRate {
+				t.Errorf("rate limit wasn't changed for client %d: actual=%f, expected at least=%f",
+					i, actualRate, expectedUpperRate)
 			}
 		} else {
-			if actualRate > expectedRate {
-				t.Errorf("rate exceeded for client %d: actual=%f, expected=%f",
-					i, actualRate, expectedRate)
+			if actualRate < expectedLowerRate {
+				t.Errorf("rate was too low for client: actual=%f, expected at least=%f",
+					actualRate, expectedLowerRate)
+			}
+			if actualRate > expectedUpperRate {
+				t.Errorf("rate was too high for client %d: actual=%f, expected at most=%f",
+					i, actualRate, expectedUpperRate)
 			}
 		}
 	}
@@ -243,16 +262,16 @@ func (c *testClient) sendRequest() error {
 	if err != nil {
 		return err
 	}
-	io.Copy(ioutil.Discard, resp.Body)
+	bodyLen, _ := io.Copy(ioutil.Discard, resp.Body)
 	defer resp.Body.Close()
-	atomic.AddUint64(&c.downloaded, uint64(resp.ContentLength))
-	headerLength := 0
+	atomic.AddUint64(&c.downloaded, uint64(bodyLen))
+	headerLen := 0
 	for k, vs := range resp.Header {
-		headerLength += len(k)
+		headerLen += len(k)
 		for _, v := range vs {
-			headerLength += len(v)
+			headerLen += len(v)
 		}
 	}
-	atomic.AddUint64(&c.downloaded, uint64(headerLength))
+	atomic.AddUint64(&c.downloaded, uint64(headerLen))
 	return nil
 }
