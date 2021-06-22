@@ -118,7 +118,6 @@ type conn struct {
 	mu       sync.Mutex    // protects the below fields
 	lim      *rate.Limiter // per conn limiter
 	deadline time.Time
-	balance  int // number of pessimistically spent buckets from the last write (<=0)
 }
 
 func (c *conn) Read(b []byte) (n int, err error) {
@@ -135,8 +134,6 @@ func (c *conn) Write(b []byte) (n int, err error) {
 	c.mu.Lock()
 	localLim := c.lim
 	deadline := c.deadline
-	balance := c.balance
-	c.balance = 0
 	c.mu.Unlock()
 
 	nwrite := len(b)
@@ -147,36 +144,33 @@ func (c *conn) Write(b []byte) (n int, err error) {
 		nwrite = perConnLimit
 	}
 
-	// Spend the tokens pessimistically taking the saved balance into account.
-	ntokens := nwrite + balance
-	if ntokens > 0 {
-		ctx := context.Background()
-		if !deadline.IsZero() {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(context.Background(), deadline)
-			defer cancel()
-		}
+	ctx := context.Background()
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+	}
 
-		if err := globalLim.WaitN(ctx, ntokens); err != nil {
-			return 0, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
+	nwrote := 0
+	for nwrote != len(b) {
+		// Spend up to nwrite tokens upfront.
+		if err := globalLim.WaitN(ctx, nwrite); err != nil {
+			return nwrote, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
 		}
-		if err := localLim.WaitN(ctx, ntokens); err != nil {
-			return 0, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
+		if err := localLim.WaitN(ctx, nwrite); err != nil {
+			return nwrote, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
+		}
+		// Do the actual write.
+		end := nwrote + nwrite
+		if end > len(b) {
+			end = len(b)
+		}
+		n, err := c.wrapped.Write(b[nwrote:end])
+		nwrote += n
+		if err != nil {
+			return nwrote, err
 		}
 	}
-	// Do the actual write.
-	nwrote, err := c.wrapped.Write(b[:nwrite])
-	if err != nil {
-		return nwrote, err
-	}
-	// Update the balance to consider it during the next write.
-	c.mu.Lock()
-	c.balance += nwrote - nwrite
-	if ntokens < 0 {
-		c.balance += ntokens // unspent remainder
-	}
-	c.mu.Unlock()
-
 	return nwrote, nil
 }
 

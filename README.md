@@ -22,7 +22,6 @@ lim.SetLimits(64*1024, 4*1024)
 ## Known Limitations
 
 * The rate limit is only applied to outbound server traffic.
-* If write deadlines are set on the accepted connections, they may be exceeded by ~2x.
 * Write errors are ignored when calculating the rate limit.
 * Both tests and functionality are minimal.
 

@@ -83,6 +83,14 @@ func TestListener(t *testing.T) {
 				l.SetLimits(0, 64*1024) // 64 KB/sec
 			},
 		},
+		{
+			name:            "low bandwidth limit per server",
+			perConnLimit:    1024,     // 1 KB/sec
+			bodySize:        3 * 1024, // 3 KB
+			numberOfClients: 1,
+			numberOfReqs:    1,
+			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op
+		},
 	}
 
 	for _, tc := range testCases {
