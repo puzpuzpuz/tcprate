@@ -59,7 +59,7 @@ func TestListener(t *testing.T) {
 			perConnLimit:    8 * 1024,  //  8 KB/sec
 			bodySize:        32 * 1024, // 32 KB
 			numberOfClients: 2,
-			numberOfReqs:    3,
+			numberOfReqs:    6,
 			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op
 		},
 		{
@@ -87,7 +87,7 @@ func TestListener(t *testing.T) {
 		{
 			name:            "low bandwidth limit per conn",
 			perConnLimit:    1024,      //  1 KB/sec
-			bodySize:        16 * 1024, // 16 KB
+			bodySize:        20 * 1024, // 20 KB
 			numberOfClients: 1,
 			numberOfReqs:    1,
 			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op

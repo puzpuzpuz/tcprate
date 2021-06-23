@@ -153,19 +153,19 @@ func (c *conn) Write(b []byte) (n int, err error) {
 
 	nwrote := 0
 	for nwrote != len(b) {
-		// Spend up to nwrite tokens upfront.
-		if err := globalLim.WaitN(ctx, nwrite); err != nil {
+		nleft := nwrite
+		if nleft > len(b)-nwrote {
+			nleft = len(b) - nwrote
+		}
+		// Spend up to nleft tokens upfront.
+		if err := globalLim.WaitN(ctx, nleft); err != nil {
 			return nwrote, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
 		}
-		if err := localLim.WaitN(ctx, nwrite); err != nil {
+		if err := localLim.WaitN(ctx, nleft); err != nil {
 			return nwrote, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
 		}
 		// Do the actual write.
-		end := nwrote + nwrite
-		if end > len(b) {
-			end = len(b)
-		}
-		n, err := c.wrapped.Write(b[nwrote:end])
+		n, err := c.wrapped.Write(b[nwrote : nwrote+nleft])
 		nwrote += n
 		if err != nil {
 			return nwrote, err
