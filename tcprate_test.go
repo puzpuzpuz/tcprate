@@ -50,7 +50,7 @@ func TestListener(t *testing.T) {
 			perConnLimit:    4 * 1024, // 4 KB/sec
 			bodySize:        1024,     // 1 KB
 			numberOfClients: 10,
-			numberOfReqs:    64,
+			numberOfReqs:    75,
 			changeLimitFn:   func(l *tcprate.Listener) {}, // no-op
 		},
 		{

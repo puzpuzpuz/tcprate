@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -22,10 +23,19 @@ import (
 // The underlying algorithm is based on token buckets.
 // See https://en.wikipedia.org/wiki/Token_bucket for more about token buckets.
 type Listener struct {
-	wrapped      net.Listener
-	mu           sync.RWMutex  // protects the below fields
-	lim          *rate.Limiter // global limiter
-	conns        map[*conn]bool
+	wrapped net.Listener
+	cfg     atomic.Value // the value changes on SetLimits calls
+	mu      sync.Mutex   // protects the below fields
+	conns   map[*conn]bool
+}
+
+// lisCfg holds listener configuration, like rates and the per server
+// limiter.
+//
+// Each conn holds a reference to the latest lisCfg. This helps with
+// avoiding contention on the config values in the Write calls.
+type lisCfg struct {
+	lim          *rate.Limiter // global limiter; nil when limit == 0
 	limit        int
 	perConnLimit int
 }
@@ -33,11 +43,12 @@ type Listener struct {
 // NewListener creates and returns a new rate limited wrapper for the given
 // net.Listener.
 func NewListener(l net.Listener) *Listener {
-	return &Listener{
+	lis := &Listener{
 		wrapped: l,
-		lim:     newLimiter(0),
 		conns:   make(map[*conn]bool),
 	}
+	lis.cfg.Store(&lisCfg{})
+	return lis
 }
 
 // SetLimits changes the limits applied to the listener.
@@ -64,10 +75,15 @@ func (l *Listener) SetLimits(limit, perConnLimit int) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.limit = limit
-	l.perConnLimit = perConnLimit
+	lisCfg := &lisCfg{
+		limit:        limit,
+		perConnLimit: perConnLimit,
+	}
+	if limit > 0 {
+		lisCfg.lim = newLimiter(limit)
+	}
+	l.cfg.Store(lisCfg)
 
-	l.lim = newLimiter(limit)
 	for c := range l.conns {
 		c.mu.Lock()
 		c.lim = newLimiter(perConnLimit)
@@ -84,10 +100,11 @@ func (l *Listener) Accept() (net.Conn, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	lisCfg := l.cfg.Load().(*lisCfg)
 	conn := &conn{
 		lis:     l,
 		wrapped: c,
-		lim:     newLimiter(l.perConnLimit),
+		lim:     newLimiter(lisCfg.perConnLimit),
 	}
 	l.conns[conn] = true
 	return conn, nil
@@ -125,11 +142,10 @@ func (c *conn) Read(b []byte) (n int, err error) {
 }
 
 func (c *conn) Write(b []byte) (n int, err error) {
-	c.lis.mu.RLock()
-	globalLim := c.lis.lim
-	limit := c.lis.limit
-	perConnLimit := c.lis.perConnLimit
-	c.lis.mu.RUnlock()
+	lisCfg := c.lis.cfg.Load().(*lisCfg)
+	globalLim := lisCfg.lim
+	limit := lisCfg.limit
+	perConnLimit := lisCfg.perConnLimit
 
 	c.mu.Lock()
 	localLim := c.lim
@@ -158,8 +174,10 @@ func (c *conn) Write(b []byte) (n int, err error) {
 			nleft = len(b) - nwrote
 		}
 		// Spend up to nleft tokens upfront.
-		if err := globalLim.WaitN(ctx, nleft); err != nil {
-			return nwrote, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
+		if globalLim != nil {
+			if err := globalLim.WaitN(ctx, nleft); err != nil {
+				return nwrote, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
+			}
 		}
 		if err := localLim.WaitN(ctx, nleft); err != nil {
 			return nwrote, fmt.Errorf("deadline exceeded: %v", os.ErrDeadlineExceeded)
